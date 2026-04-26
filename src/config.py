@@ -26,8 +26,12 @@ class EdgeConfig:
 
     stream_id: str = "cam-01"
     prompt: str = "Describe the whole video in one short sentence."
-    model: str = "/home/mambauser/tangxuan/models/Qwen3-VL-8B-Instruct"
+    model: str = "/home/mambauser/tangxuan/models/Qwen3-VL-8B-Instruct-FP8"
     max_tokens: int = 24
+
+    # Initial α that the cloud controller starts from. Mostly useful for
+    # static A/B baselines where controller is OFF and α stays at this value.
+    alpha: float = 1.0
 
     anchor_embed_dim: int = 16
 
@@ -35,3 +39,6 @@ class EdgeConfig:
     codec_hint: str = "h264"
 
     linger_s: float = 30.0
+
+    pace_realtime: bool = False
+    loop_source: bool = False
