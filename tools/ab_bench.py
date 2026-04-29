@@ -66,6 +66,34 @@ CONFIGS = [
         "alpha": 0.5,
     },
     {
+        "name": "static_rho075",
+        "description": "ρ=0.75 α=1.0 static (rho-only sweep)",
+        "controller_enabled": False,
+        "rho": 0.75,
+        "alpha": 1.0,
+    },
+    {
+        "name": "static_rho050",
+        "description": "ρ=0.5 α=1.0 static (rho-only sweep)",
+        "controller_enabled": False,
+        "rho": 0.5,
+        "alpha": 1.0,
+    },
+    {
+        "name": "static_rho025",
+        "description": "ρ=0.25 α=1.0 static (rho-only sweep)",
+        "controller_enabled": False,
+        "rho": 0.25,
+        "alpha": 1.0,
+    },
+    {
+        "name": "static_rho005",
+        "description": "ρ=0.05 α=1.0 static (rho-only emergency-brake baseline)",
+        "controller_enabled": False,
+        "rho": 0.05,
+        "alpha": 1.0,
+    },
+    {
         "name": "bava_dynamic",
         "description": "ρ=0.5 initial, controller ON, climb-back + per-stream weighting",
         "controller_enabled": True,
@@ -229,6 +257,7 @@ def run_bench(
     alpha: Optional[float],
     window_seconds: float,
     max_tokens: int,
+    prompt: str,
     out_dir: Path,
 ) -> Dict[str, Any]:
     cmd = [
@@ -240,6 +269,7 @@ def run_bench(
         "--rho", str(rho),
         "--window-seconds", str(window_seconds),
         "--max-tokens", str(max_tokens),
+        "--prompt", prompt,
         "--probe-interval", "0.5",
         "--out", str(out_dir),
         "--sources", *sources_globs,
@@ -273,6 +303,17 @@ def main() -> int:
     p.add_argument("--sources", nargs="+", required=True)
     p.add_argument("--window-seconds", type=float, default=2.0)
     p.add_argument("--max-tokens", type=int, default=12)
+    p.add_argument(
+        "--prompt",
+        default="In one short sentence, describe what is happening in this clip.",
+        help="prompt sent to the VLM for every window",
+    )
+    p.add_argument("--frames-per-window", type=int, default=4,
+                   help="BAVA_MAX_FRAMES_PER_WINDOW for the intake — raise to push KV pressure")
+    p.add_argument("--max-queued-windows", type=int, default=4,
+                   help="BAVA_MAX_QUEUED_WINDOWS for the intake")
+    p.add_argument("--stream-concurrency", type=int, default=2,
+                   help="BAVA_STREAM_CONCURRENCY for the intake")
     p.add_argument("--out", default=f"/tmp/ab_n4_{int(time.time())}")
     p.add_argument("--configs", nargs="+", default=None,
                    help="which configs by name to run; default = all 3")
@@ -292,6 +333,7 @@ def main() -> int:
         "per_config_duration": args.per_config_duration,
         "vllm_api_base": args.vllm_api_base,
         "vllm_api_bases": vllm_api_bases,
+        "prompt": args.prompt,
         "configs_run": [c["name"] for c in cfgs],
         "results": {},
     }
@@ -332,6 +374,9 @@ def main() -> int:
             extra_env={
                 "BAVA_CONTROLLER_LOG": remote_controller_log,
                 "BAVA_ANCHOR_LOG": remote_anchor_log,
+                "BAVA_MAX_FRAMES_PER_WINDOW": str(args.frames_per_window),
+                "BAVA_MAX_QUEUED_WINDOWS": str(args.max_queued_windows),
+                "BAVA_STREAM_CONCURRENCY": str(args.stream_concurrency),
             },
             log_suffix=f"_{name}",
         )
@@ -361,6 +406,7 @@ def main() -> int:
             alpha=float(cfg["alpha"]) if not cfg["controller_enabled"] else None,
             window_seconds=args.window_seconds,
             max_tokens=args.max_tokens,
+            prompt=args.prompt,
             out_dir=cfg_out,
         )
         controller_log_local = cfg_out / "controller.jsonl"
