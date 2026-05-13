@@ -120,7 +120,9 @@ export CLOUD_HOST=<cloud-host-or-tunnel-host>
 curl -fsS "http://${CLOUD_HOST}:9100/healthz" | python -m json.tool
 ```
 
-The health response should show four healthy vLLM engines.
+The health response should show the configured vLLM engines as healthy. The
+number of engines is defined by the cloud agent's JSON config, not hardcoded on
+the edge side.
 
 ## Smoke Run
 

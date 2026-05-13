@@ -3,13 +3,19 @@
 ## Role
 
 You are the cloud-side agent for the Mirage reproduction server. Your job is
-to pull the prototype from GitHub, start four online-prefill vLLM engines,
-start the BAVA intake service, expose the intake endpoint to the edge agent,
-and preserve logs needed for `yes_chunks10` aggregation.
+to pull the prototype from GitHub, build the cloud inference topology from a
+JSON config file, start the BAVA intake service, expose the intake endpoint to
+the edge agent, and preserve logs needed for `yes_chunks10` aggregation.
 
 The target experiment is N100 no-control accuracy with online-prefill
 early-finalizer enabled and video-level positives defined as cumulative
 `Yes` chunks >= 10.
+
+Important: the cloud does not have to be exactly four independent
+online-prefill vLLM processes. Use `cloud/mirage_cloud_config.example.json` as
+the source of truth and adjust it for the server: TP, DP/multiple replicas, GPU
+mapping, ports, model path, extra vLLM flags, and intake settings all live
+there.
 
 ## Repository
 
@@ -61,112 +67,91 @@ If this server does not already have the patched vLLM fork, inspect
 prototype. Apply those files on top of the matching online-prefill/tokenmerger
 vLLM fork, then run that fork's own tests before benchmarking.
 
-## Start Four vLLM Engines
+## Configure Cloud Inference JSON
 
-The accepted reference used GPU0-3 and ports 8011-8014 with:
-
-- model: Qwen3-VL-8B-Instruct-FP8
-- online-prefill enabled
-- online-prefill early-finalizer enabled
-- `max_model_len=40960`
-- `max_num_seqs=12`
-- prefix caching disabled
-- eager mode
-- static visual tokenmerger env alpha `1.0`, input `image`, block_t `1`,
-  block_hw `2`
-
-Template launcher:
+Copy and edit the example config:
 
 ```bash
-export MODEL=/path/to/Qwen3-VL-8B-Instruct-FP8
-export LOG_DIR=/tmp/bava_mirage/vllm_logs
-mkdir -p "$LOG_DIR"
-
-for i in 0 1 2 3; do
-  port=$((8011 + i))
-  log="$LOG_DIR/vllm_${port}.log"
-  pid="$LOG_DIR/vllm_${port}.pid"
-  rm -f "$log" "$pid"
-  (
-    cd "$WORK"
-    setsid env \
-      CUDA_VISIBLE_DEVICES="$i" \
-      PYTHONPATH="$VLLM_SRC:${PYTHONPATH:-}" \
-      VLLM_ONLINE_PREFILL_VISUAL_TOKEN_MERGER_ALPHA=1.0 \
-      VLLM_ONLINE_PREFILL_VISUAL_TOKEN_MERGER_BLOCK_T=1 \
-      VLLM_ONLINE_PREFILL_VISUAL_TOKEN_MERGER_BLOCK_HW=2 \
-      VLLM_ONLINE_PREFILL_VISUAL_TOKEN_MERGER_INPUT=image \
-      python -m vllm.entrypoints.openai.api_server \
-        --model "$MODEL" \
-        --trust-remote-code \
-        --host 127.0.0.1 \
-        --port "$port" \
-        --tensor-parallel-size 1 \
-        --gpu-memory-utilization 0.90 \
-        --max-model-len 40960 \
-        --enable-online-prefill \
-        --enable-online-prefill-early-finalizer \
-        --online-prefill-early-finalize-kv-usage-threshold 0.90 \
-        --online-prefill-early-finalize-min-tokens 0 \
-        --max-num-seqs 12 \
-        --no-enable-prefix-caching \
-        --enforce-eager \
-        --mm-processor-cache-gb 0 \
-        > "$log" 2>&1 </dev/null &
-    echo $! > "$pid"
-  )
-done
+cd "$REPO"
+cp cloud/mirage_cloud_config.example.json cloud/mirage_cloud_config.local.json
+$EDITOR cloud/mirage_cloud_config.local.json
 ```
 
-Wait for health:
+Fields to adapt:
+
+| JSON field | meaning |
+| --- | --- |
+| `work_root` | parent directory that contains the `edge/` repo |
+| `repo_dir` | full path to this cloned repo |
+| `vllm_src` | path to the online-prefill/tokenmerger vLLM fork |
+| `python` | Python executable from the environment that can import vLLM |
+| `model` | Qwen3-VL FP8 model path |
+| `log_root` | stable directory for intake/vLLM logs, usually `/tmp/bava_mirage` |
+| `vllm.common_args` | default vLLM CLI flags for every engine |
+| `vllm.engines[]` | one OpenAI-compatible endpoint per entry |
+| `vllm.engines[].cuda_visible_devices` | GPU set for that endpoint, e.g. `"0"` or `"0,1"` |
+| `vllm.engines[].args.tensor_parallel_size` | per-engine TP override |
+| `vllm.engines[].extra_args` | pass-through flags for local vLLM, including DP flags if supported |
+| `intake.env` | BAVA intake/controller/no-control settings |
+
+Examples:
+
+```json
+{
+  "name": "tp2_replica0",
+  "port": 8011,
+  "cuda_visible_devices": "0,1",
+  "args": {
+    "tensor_parallel_size": 2,
+    "max_num_seqs": 16
+  }
+}
+```
+
+For DP, prefer explicit replicas when possible because intake load-balances
+across OpenAI endpoints:
+
+```json
+[
+  {"name": "replica0_tp2", "port": 8011, "cuda_visible_devices": "0,1", "args": {"tensor_parallel_size": 2}},
+  {"name": "replica1_tp2", "port": 8012, "cuda_visible_devices": "2,3", "args": {"tensor_parallel_size": 2}}
+]
+```
+
+If the local vLLM fork supports data-parallel CLI flags inside one process,
+put those flags in `extra_args`; the launcher passes them through unchanged.
+
+## Start Configured vLLM Engines
+
+Use the JSON-driven launcher:
 
 ```bash
-for p in 8011 8012 8013 8014; do
-  until curl -fsS --max-time 3 "http://127.0.0.1:${p}/health" >/dev/null; do
-    echo "waiting for vLLM $p"
-    sleep 5
-  done
-done
+cd "$REPO"
+python cloud/mirage_cloud.py --config cloud/mirage_cloud_config.local.json start-vllm
+python cloud/mirage_cloud.py --config cloud/mirage_cloud_config.local.json wait-vllm --timeout-s 900
+```
+
+The launcher writes per-engine logs and pid files under:
+
+```text
+<log_root>/vllm_logs/
 ```
 
 ## Start Intake For No-Control
 
-Use a stable log path. The edge-side agent must copy this exact log after the
-run because `yes_chunks10` reads the `chunks=[...]` lines from it.
+Use the same JSON. The intake API base list is derived from
+`vllm.engines[]` unless `intake.vllm_api_base_list` is explicitly set.
 
 ```bash
-export MIRAGE=/tmp/bava_mirage
-mkdir -p "$MIRAGE"
+cd "$REPO"
+python cloud/mirage_cloud.py --config cloud/mirage_cloud_config.local.json start-intake
+```
 
-export INTAKE_HOST=0.0.0.0
-export INTAKE_PORT=9100
-export VLLM_API_BASE=http://127.0.0.1:8011
-export VLLM_API_BASE_LIST=http://127.0.0.1:8011,http://127.0.0.1:8012,http://127.0.0.1:8013,http://127.0.0.1:8014
+The edge-side agent must copy the configured `intake.log` after the run because
+`yes_chunks10` reads the `chunks=[...]` lines from it. In the example config:
 
-export BAVA_MAX_FRAMES_PER_WINDOW=100
-export BAVA_STREAM_CONCURRENCY=2
-export BAVA_MAX_QUEUED_WINDOWS=4
-
-export BAVA_CONTROLLER_ENABLED=0
-export BAVA_BUDGET_ENABLED=0
-export BAVA_SEND_WINDOW_ENABLED=0
-export BAVA_ALPHA_EXECUTOR_MODE=off
-
-export BAVA_ADMISSION_KV_WARN=999
-export BAVA_ADMISSION_KV_HIGH=999
-export BAVA_ADMISSION_KV_PANIC=999
-export BAVA_ADMISSION_PREEMPT_PANIC=999
-
-export BAVA_CONTROLLER_LOG="$MIRAGE/controller_no_control.jsonl"
-export BAVA_ANCHOR_LOG="$MIRAGE/anchors_no_control.jsonl"
-
-rm -f "$MIRAGE/intake_no_control.log" "$BAVA_CONTROLLER_LOG" "$BAVA_ANCHOR_LOG"
-
-cd "$WORK"
-setsid env PYTHONPATH="$WORK:$REPO/cloud:$VLLM_SRC:${PYTHONPATH:-}" \
-  python -m intake.server \
-  > "$MIRAGE/intake_no_control.log" 2>&1 </dev/null &
-echo $! > "$MIRAGE/intake_no_control.pid"
+```text
+/tmp/bava_mirage/intake_no_control.log
 ```
 
 Health check:
@@ -200,11 +185,8 @@ http://127.0.0.1:19100
 Watch logs:
 
 ```bash
-tail -f "$MIRAGE/intake_no_control.log"
-for p in 8011 8012 8013 8014; do
-  curl -fsS "http://127.0.0.1:${p}/metrics" | \
-    egrep 'vllm:num_requests_running|vllm:num_requests_waiting|vllm:gpu_cache_usage_perc' || true
-done
+tail -f /tmp/bava_mirage/intake_no_control.log
+python cloud/mirage_cloud.py --config cloud/mirage_cloud_config.local.json status
 ```
 
 Fatal signatures that should remain zero in intake logs:
@@ -229,26 +211,19 @@ Stop intake cleanly:
 
 ```bash
 curl -fsS --max-time 8 -X POST http://127.0.0.1:9100/admin/purge_sessions || true
-pkill -TERM -f 'python -m intake.server' || true
-sleep 2
-pkill -KILL -f 'python -m intake.server' || true
+python cloud/mirage_cloud.py --config cloud/mirage_cloud_config.local.json stop-intake
 ```
 
 Verify vLLM idle:
 
 ```bash
-for p in 8011 8012 8013 8014; do
-  echo "port=$p"
-  curl -fsS "http://127.0.0.1:${p}/health" >/dev/null && echo health=ok
-  curl -fsS "http://127.0.0.1:${p}/metrics" | \
-    egrep 'vllm:num_requests_running|vllm:num_requests_waiting|vllm:gpu_cache_usage_perc' || true
-done
+python cloud/mirage_cloud.py --config cloud/mirage_cloud_config.local.json status
 ```
 
 If any port remains with `waiting > 0` or `running > 0` after a few minutes,
-restart the four vLLM engines and record that restore was needed. The reference
-accepted run had `fatal_total=0` but still needed a final restore because one
-port had a residual `waiting=1`.
+restart the configured vLLM engines and record that restore was needed. The
+reference accepted run had `fatal_total=0` but still needed a final restore
+because one port had a residual `waiting=1`.
 
 Keep these files available for the edge agent:
 
@@ -256,10 +231,7 @@ Keep these files available for the edge agent:
 /tmp/bava_mirage/intake_no_control.log
 /tmp/bava_mirage/controller_no_control.jsonl
 /tmp/bava_mirage/anchors_no_control.jsonl
-/tmp/bava_mirage/vllm_logs/vllm_8011.log
-/tmp/bava_mirage/vllm_logs/vllm_8012.log
-/tmp/bava_mirage/vllm_logs/vllm_8013.log
-/tmp/bava_mirage/vllm_logs/vllm_8014.log
+/tmp/bava_mirage/vllm_logs/*.log
 ```
 
 ## Reference Result

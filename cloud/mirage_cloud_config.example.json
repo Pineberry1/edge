@@ -1,0 +1,74 @@
+{
+  "work_root": "/home/mambauser/mirage_bava",
+  "repo_dir": "/home/mambauser/mirage_bava/edge",
+  "vllm_src": "/home/mambauser/tangxuan/online_vllm/vllm_online_prefill_finalizer",
+  "python": "python",
+  "model": "/home/mambauser/tangxuan/models/Qwen3-VL-8B-Instruct-FP8",
+  "log_root": "/tmp/bava_mirage",
+  "vllm": {
+    "common_env": {
+      "VLLM_ONLINE_PREFILL_VISUAL_TOKEN_MERGER_ALPHA": "1.0",
+      "VLLM_ONLINE_PREFILL_VISUAL_TOKEN_MERGER_BLOCK_T": "1",
+      "VLLM_ONLINE_PREFILL_VISUAL_TOKEN_MERGER_BLOCK_HW": "2",
+      "VLLM_ONLINE_PREFILL_VISUAL_TOKEN_MERGER_INPUT": "image"
+    },
+    "common_args": {
+      "trust_remote_code": true,
+      "host": "127.0.0.1",
+      "tensor_parallel_size": 1,
+      "gpu_memory_utilization": 0.9,
+      "max_model_len": 40960,
+      "max_num_seqs": 12,
+      "enable_online_prefill": true,
+      "enable_online_prefill_early_finalizer": true,
+      "online_prefill_early_finalize_kv_usage_threshold": 0.9,
+      "online_prefill_early_finalize_min_tokens": 0,
+      "no_enable_prefix_caching": true,
+      "enforce_eager": true,
+      "mm_processor_cache_gb": 0
+    },
+    "engines": [
+      {
+        "name": "gpu0",
+        "port": 8011,
+        "cuda_visible_devices": "0"
+      },
+      {
+        "name": "gpu1",
+        "port": 8012,
+        "cuda_visible_devices": "1"
+      },
+      {
+        "name": "gpu2",
+        "port": 8013,
+        "cuda_visible_devices": "2"
+      },
+      {
+        "name": "gpu3",
+        "port": 8014,
+        "cuda_visible_devices": "3"
+      }
+    ]
+  },
+  "intake": {
+    "host": "0.0.0.0",
+    "port": 9100,
+    "log_path": "/tmp/bava_mirage/intake_no_control.log",
+    "pid_path": "/tmp/bava_mirage/intake_no_control.pid",
+    "controller_log": "/tmp/bava_mirage/controller_no_control.jsonl",
+    "anchor_log": "/tmp/bava_mirage/anchors_no_control.jsonl",
+    "env": {
+      "BAVA_MAX_FRAMES_PER_WINDOW": "100",
+      "BAVA_STREAM_CONCURRENCY": "2",
+      "BAVA_MAX_QUEUED_WINDOWS": "4",
+      "BAVA_CONTROLLER_ENABLED": "0",
+      "BAVA_BUDGET_ENABLED": "0",
+      "BAVA_SEND_WINDOW_ENABLED": "0",
+      "BAVA_ALPHA_EXECUTOR_MODE": "off",
+      "BAVA_ADMISSION_KV_WARN": "999",
+      "BAVA_ADMISSION_KV_HIGH": "999",
+      "BAVA_ADMISSION_KV_PANIC": "999",
+      "BAVA_ADMISSION_PREEMPT_PANIC": "999"
+    }
+  }
+}
