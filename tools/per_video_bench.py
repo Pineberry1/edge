@@ -20,7 +20,7 @@ Usage:
       --rho 1.0 --alpha 1.0 \
       --window-seconds 40 --max-tokens 8 \
       --concurrency 4 --linger-s 30 \
-      --prompt "Does this video clip contain any abnormal, criminal, or unsafe activity? Answer with only 'Yes' or 'No'." \
+      --prompt "Classify this video clip for surveillance anomaly detection. Output only Yes or No. Yes means the clip shows one of these abnormal categories: arrest, arson, assault, burglary, fighting, road accident, robbery, shooting, shoplifting, stealing, vandalism, explosion, abuse, or any clearly unsafe/criminal behavior. No means normal non-criminal activity without visible danger." \
       --cloud-ws-url ws://127.0.0.1:19100/stream \
       --intake-admin-base http://127.0.0.1:19100 \
       --out edge/data/bench_runs/.../static_full
@@ -77,11 +77,14 @@ def launch_edge_once(
     rho: float,
     alpha: Optional[float],
     window_s: float,
+    decision_window_s: float,
     max_tokens: int,
     prompt: str,
     log_path: Path,
     linger_s: float,
     pace_realtime: bool,
+    inference_mode: str,
+    visual_memory_merge: bool,
 ) -> subprocess.Popen:
     """Launch a single edge_main subprocess that plays `source` once to EOF.
 
@@ -97,14 +100,18 @@ def launch_edge_once(
         "--stream-id", stream_id,
         "--rho", str(rho),
         "--window-seconds", str(window_s),
+        "--decision-window-seconds", str(decision_window_s),
         "--max-tokens", str(max_tokens),
         "--linger-s", str(linger_s),
         "--prompt", prompt,
+        "--inference-mode", inference_mode,
     ]
     if pace_realtime:
         cmd.append("--pace-realtime")
     if alpha is not None:
         cmd += ["--alpha", str(alpha)]
+    if visual_memory_merge:
+        cmd.append("--visual-memory-merge")
     log_fp = log_path.open("w")
     proc = subprocess.Popen(
         cmd, cwd=str(REPO), env=env,
@@ -127,15 +134,42 @@ def main() -> int:
                    help="TSV with header video_id\\tlabel\\tcloud_path\\tduration_s; cloud_path is overridden by --source-prefix")
     p.add_argument("--source-prefix", default="",
                    help="if set, replace the directory portion of each cloud_path with this prefix")
+    p.add_argument("--local-root", type=Path, default=None,
+                   help="local root used to remap cloud_path when it starts with --remote-prefix")
+    p.add_argument("--remote-prefix",
+                   default="/home/mambauser/tangxuan/ucf_crime_hf",
+                   help="remote dataset prefix to replace with --local-root")
     p.add_argument("--cloud-ws-url", default="ws://127.0.0.1:19100/stream")
     p.add_argument("--intake-admin-base", default="http://127.0.0.1:19100")
     p.add_argument("--rho", type=float, default=1.0)
     p.add_argument("--alpha", type=float, default=None)
     p.add_argument("--window-seconds", type=float, default=40.0)
+    p.add_argument(
+        "--decision-window-seconds",
+        type=float,
+        default=40.0,
+        help="edge-side stream_end/detection cadence; window-seconds remains prefill chunk size",
+    )
     p.add_argument("--max-tokens", type=int, default=8)
-    p.add_argument("--prompt",
-                   default="Does this video clip contain any abnormal, criminal, "
-                           "or unsafe activity? Answer with only 'Yes' or 'No'.")
+    p.add_argument(
+        "--prompt",
+        default=(
+            "Classify this video clip for surveillance anomaly detection. "
+            "Output only Yes or No. Yes means the clip shows one of these "
+            "abnormal categories: arrest, arson, assault, burglary, fighting, "
+            "road accident, robbery, shooting, shoplifting, stealing, vandalism, "
+            "explosion, abuse, or any clearly unsafe/criminal behavior. No means "
+            "normal non-criminal activity without visible danger."
+        ),
+    )
+    p.add_argument("--inference-mode", choices=["online_prefill", "completion"], default="online_prefill")
+    p.add_argument("--completion-mode", action="store_true",
+                   help="shortcut for --inference-mode completion")
+    p.add_argument(
+        "--visual-memory-merge",
+        action="store_true",
+        help="set hello.visual_memory_merge=true for each edge stream",
+    )
     p.add_argument("--concurrency", type=int, default=4)
     p.add_argument("--linger-s", type=float, default=30.0)
     p.add_argument("--pace-realtime", action="store_true",
@@ -149,12 +183,23 @@ def main() -> int:
     p.add_argument("--limit", type=int, default=0,
                    help="limit number of videos (0 = all)")
     args = p.parse_args()
+    if args.completion_mode:
+        args.inference_mode = "completion"
 
     out = args.out
     out.mkdir(parents=True, exist_ok=True)
 
     videos = read_manifest(args.manifest)
-    if args.source_prefix:
+    if args.local_root is not None:
+        remote_prefix = args.remote_prefix.rstrip("/")
+        for v in videos:
+            cloud_path = str(v["cloud_path"])
+            if cloud_path.startswith(remote_prefix + "/"):
+                rel = cloud_path[len(remote_prefix) + 1:]
+                v["source"] = str(args.local_root / rel)
+            else:
+                v["source"] = cloud_path
+    elif args.source_prefix:
         for v in videos:
             v["source"] = str(Path(args.source_prefix) / Path(v["cloud_path"]).name) \
                 if Path(v["cloud_path"]).parent != Path(args.source_prefix) else \
@@ -166,7 +211,8 @@ def main() -> int:
         videos = videos[: args.limit]
     n = len(videos)
     print(f"[per-video] {n} videos, concurrency={args.concurrency}, "
-          f"window={args.window_seconds}s, linger={args.linger_s}s")
+          f"prefill_window={args.window_seconds}s, "
+          f"decision_window={args.decision_window_seconds}s, linger={args.linger_s}s")
 
     # Validate sources exist locally
     missing = [v for v in videos if not Path(v["source"]).exists()]
@@ -195,10 +241,10 @@ def main() -> int:
             v = videos[vidx]
             sid = f"v-{vidx:03d}"
             log_path = out / f"edge-{sid}.log"
-            window_count = max(1, math.ceil(v["duration_s"] / args.window_seconds))
+            window_count = max(1, math.ceil(v["duration_s"] / args.decision_window_seconds))
             started = time.time()
             print(f"[per-video][slot{slot}] {sid} {v['label']} {v['video_id']} "
-                  f"dur={v['duration_s']:.1f}s windows={window_count} -> launching")
+                  f"dur={v['duration_s']:.1f}s decision_windows={window_count} -> launching")
             proc = launch_edge_once(
                 stream_id=sid,
                 source=v["source"],
@@ -206,11 +252,14 @@ def main() -> int:
                 rho=args.rho,
                 alpha=args.alpha,
                 window_s=args.window_seconds,
+                decision_window_s=args.decision_window_seconds,
                 max_tokens=args.max_tokens,
                 prompt=args.prompt,
                 log_path=log_path,
                 linger_s=args.linger_s,
                 pace_realtime=args.pace_realtime,
+                inference_mode=args.inference_mode,
+                visual_memory_merge=bool(args.visual_memory_merge),
             )
             timeout = v["duration_s"] + args.linger_s + 60.0
             timeout = min(timeout, args.per_video_timeout)
@@ -266,6 +315,7 @@ def main() -> int:
                     "source": v["source"],
                     "duration_s": v["duration_s"],
                     "window_seconds": args.window_seconds,
+                    "decision_window_seconds": args.decision_window_seconds,
                     "window_count": window_count,
                     "started_at": started,
                     "ended_at": ended,
@@ -315,10 +365,13 @@ def main() -> int:
         "n_videos": n,
         "concurrency": args.concurrency,
         "window_seconds": args.window_seconds,
+        "decision_window_seconds": args.decision_window_seconds,
         "max_tokens": args.max_tokens,
         "rho": args.rho,
         "alpha": args.alpha,
         "prompt": args.prompt,
+        "inference_mode": args.inference_mode,
+        "visual_memory_merge": bool(args.visual_memory_merge),
         "intake_admin_base": args.intake_admin_base,
         "cloud_ws_url": args.cloud_ws_url,
         "linger_s": args.linger_s,

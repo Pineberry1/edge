@@ -24,10 +24,13 @@ import time
 from collections import deque
 from typing import Any, Dict, Optional
 
+from .budget_state import BudgetState
 from .config import EdgeConfig
 from .rho_state import RhoState
 from .wire import (
     MSG_BYE,
+    MSG_BUDGET_UPDATE,
+    MSG_EARLY_FINALIZE,
     MSG_HELLO,
     MSG_RESULT,
     MSG_RHO_UPDATE,
@@ -44,7 +47,12 @@ except Exception:  # pragma: no cover - helpful error at import time
 class Uplink:
     """Background-thread WebSocket client with a blocking-style send API."""
 
-    def __init__(self, cfg: EdgeConfig, rho_state: RhoState) -> None:
+    def __init__(
+        self,
+        cfg: EdgeConfig,
+        rho_state: RhoState,
+        budget_state: Optional[BudgetState] = None,
+    ) -> None:
         if _ws_connect is None:
             raise RuntimeError(
                 "websockets package not available; install with "
@@ -52,6 +60,7 @@ class Uplink:
             )
         self.cfg = cfg
         self.rho_state = rho_state
+        self.budget_state = budget_state
         self._hello: Dict[str, Any] = {}
         self._thread: Optional[threading.Thread] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -63,6 +72,8 @@ class Uplink:
         self.sent_packets = 0
         self.sent_bytes = 0
         self.dropped_packets = 0
+        self.last_send_wait_ms = 0.0
+        self.ewma_send_wait_ms = 0.0
         self.results: deque = deque(maxlen=64)
 
     # -------- public API (main thread) --------
@@ -83,6 +94,12 @@ class Uplink:
     def send_control(self, obj: Dict[str, Any]) -> bool:
         return self._submit(("text", json.dumps(obj, separators=(",", ":"))))
 
+    @property
+    def queue_size(self) -> int:
+        if self._out_q is None:
+            return 0
+        return int(self._out_q.qsize())
+
     def wait_connected(self, timeout: float = 10.0) -> bool:
         """Block until the WS client has completed its initial handshake."""
         return self._connected.wait(timeout=timeout)
@@ -99,12 +116,22 @@ class Uplink:
             _t.sleep(0.05)
         return False
 
-    def close(self, drain_timeout: float = 15.0, linger_s: float = 2.0, join_timeout: float = 3.0) -> None:
+    def close(
+        self,
+        drain_timeout: float = 15.0,
+        linger_s: float = 2.0,
+        join_timeout: float = 3.0,
+        linger_until_results: int = 0,
+    ) -> None:
         self.wait_connected(timeout=2.0)
         self.wait_drained(timeout=drain_timeout)
         if linger_s > 0:
             import time as _t
-            _t.sleep(linger_s)
+            deadline = _t.time() + linger_s
+            while _t.time() < deadline:
+                if linger_until_results > 0 and len(self.results) >= linger_until_results:
+                    break
+                _t.sleep(min(0.25, max(0.0, deadline - _t.time())))
         self.send_control({"kind": MSG_BYE})
         self.wait_drained(timeout=1.0)
         self._stop.set()
@@ -119,7 +146,7 @@ class Uplink:
             self.dropped_packets += 1
             return False
         try:
-            self._loop.call_soon_threadsafe(self._put_nowait, item)
+            self._loop.call_soon_threadsafe(self._put_nowait, (*item, time.perf_counter()))
             return True
         except RuntimeError:
             self.dropped_packets += 1
@@ -189,7 +216,17 @@ class Uplink:
             item = await self._out_q.get()
             if item is None:
                 return
-            kind, data = item
+            if len(item) == 3:
+                kind, data, enqueued_at = item
+            else:
+                kind, data = item
+                enqueued_at = time.perf_counter()
+            wait_ms = max(0.0, (time.perf_counter() - float(enqueued_at)) * 1000.0)
+            self.last_send_wait_ms = wait_ms
+            if self.ewma_send_wait_ms <= 0:
+                self.ewma_send_wait_ms = wait_ms
+            else:
+                self.ewma_send_wait_ms = 0.8 * self.ewma_send_wait_ms + 0.2 * wait_ms
             if kind == "sentinel":
                 return
             try:
@@ -222,6 +259,54 @@ class Uplink:
                 sys.stderr.write(
                     f"[edge-uplink] rho update {old:.3f} -> {applied:.3f} "
                     f"reason={msg.get('reason')!r}\n"
+                )
+            elif kind == MSG_BUDGET_UPDATE:
+                if self.cfg.inference_mode == "completion":
+                    continue
+                if self.budget_state is None:
+                    continue
+                try:
+                    version = int(msg["version"])
+                    windows = int(msg["windows_per_decision"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                reason = str(msg.get("reason") or "cloud")
+                if self.budget_state.set(version, windows, reason):
+                    sys.stderr.write(
+                        f"[edge-uplink] budget update version={version} "
+                        f"windows={windows} reason={reason}\n"
+                    )
+            elif kind == MSG_EARLY_FINALIZE:
+                if self.cfg.inference_mode == "completion":
+                    continue
+                if self.budget_state is None:
+                    continue
+                reason = str(msg.get("reason") or "early_finalize")
+                try:
+                    if "version" in msg and "windows_per_decision" in msg:
+                        version = int(msg["version"])
+                        windows = int(msg["windows_per_decision"])
+                        if self.budget_state.set(version, windows, reason):
+                            sys.stderr.write(
+                                f"[edge-uplink] budget update version={version} "
+                                f"windows={windows} reason={reason}\n"
+                            )
+                except (TypeError, ValueError):
+                    pass
+                decision_id = None
+                try:
+                    if msg.get("decision_id") is not None:
+                        decision_id = int(msg["decision_id"])
+                except (TypeError, ValueError):
+                    decision_id = None
+                self.budget_state.request_force_close(
+                    reason=reason,
+                    decision_id=decision_id,
+                    stream_id=str(msg.get("stream_id") or ""),
+                )
+                sys.stderr.write(
+                    f"[edge-uplink] early_finalize decision={decision_id} "
+                    f"reason={reason}; forcing current decision boundary\n"
                 )
             elif kind == MSG_RESULT:
                 self.results.append({"at": time.time(), **msg})

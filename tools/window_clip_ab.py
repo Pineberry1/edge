@@ -62,6 +62,8 @@ def run_window_bench(args: argparse.Namespace, cfg: dict[str, Any], out_dir: Pat
         cmd.append("--pace-realtime")
     if args.stop_after_result:
         cmd.append("--stop-after-result")
+    if args.visual_memory_merge:
+        cmd.append("--visual-memory-merge")
     if not cfg["controller_enabled"]:
         cmd += ["--alpha", str(cfg["alpha"])]
 
@@ -97,6 +99,31 @@ def main() -> int:
                         "criminal, or unsafe activity? Answer with only Yes or No.")
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--pace-realtime", action="store_true")
+    parser.add_argument(
+        "--visual-memory-merge",
+        action="store_true",
+        help="set hello.visual_memory_merge=true for each window stream",
+    )
+    parser.add_argument(
+        "--visual-memory-num-frames",
+        type=int,
+        default=int(os.environ.get("BAVA_VISUAL_MEMORY_NUM_FRAMES", "8")),
+    )
+    parser.add_argument(
+        "--visual-memory-tokens-per-frame",
+        type=int,
+        default=int(os.environ.get("BAVA_VISUAL_MEMORY_TOKENS_PER_FRAME", "32")),
+    )
+    parser.add_argument(
+        "--visual-memory-text-prefix",
+        default=os.environ.get("BAVA_VISUAL_MEMORY_TEXT_PREFIX", ""),
+    )
+    parser.add_argument(
+        "--visual-memory-warm-prefix-cache",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="warm prefix cache after exporting visual memory (default: intake env)",
+    )
     parser.add_argument("--stop-after-result", action="store_true")
     parser.add_argument("--out", required=True, type=Path)
     args = parser.parse_args()
@@ -115,6 +142,13 @@ def main() -> int:
         "configs_run": [cfg["name"] for cfg in cfgs],
         "vllm_api_bases": vllm_bases,
         "frames_per_window": args.frames_per_window,
+        "visual_memory_merge": bool(args.visual_memory_merge),
+        "visual_memory": {
+            "num_frames": int(args.visual_memory_num_frames),
+            "tokens_per_frame": int(args.visual_memory_tokens_per_frame),
+            "text_prefix": args.visual_memory_text_prefix,
+            "warm_prefix_cache": args.visual_memory_warm_prefix_cache,
+        },
         "prompt": args.prompt,
         "results": {},
     }
@@ -154,6 +188,22 @@ def main() -> int:
                     "BAVA_MAX_FRAMES_PER_WINDOW": str(args.frames_per_window),
                     "BAVA_MAX_QUEUED_WINDOWS": str(args.max_queued_windows),
                     "BAVA_STREAM_CONCURRENCY": str(args.stream_concurrency),
+                    "BAVA_VISUAL_MEMORY_NUM_FRAMES": str(
+                        args.visual_memory_num_frames
+                    ),
+                    "BAVA_VISUAL_MEMORY_TOKENS_PER_FRAME": str(
+                        args.visual_memory_tokens_per_frame
+                    ),
+                    "BAVA_VISUAL_MEMORY_TEXT_PREFIX": args.visual_memory_text_prefix,
+                    **(
+                        {
+                            "BAVA_VISUAL_MEMORY_WARM_PREFIX_CACHE": (
+                                "1" if args.visual_memory_warm_prefix_cache else "0"
+                            )
+                        }
+                        if args.visual_memory_warm_prefix_cache is not None
+                        else {}
+                    ),
                 },
                 log_suffix=f"_window_{name}",
             )

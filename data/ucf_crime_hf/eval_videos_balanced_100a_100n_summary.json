@@ -1,0 +1,91 @@
+{
+  "created_for": "balanced UCF-Crime realtime N=100 pressure/accuracy expansion",
+  "selection_policy": {
+    "included_existing_eval_videos": true,
+    "existing_eval_counts": {
+      "anomaly": 16,
+      "normal": 20
+    },
+    "full_source_tsv": "/home/admin123/tangxuan/edge/data/ucf_crime_hf/eval_videos_recon_mp4.tsv",
+    "local_path_prefix": "/home/admin123/tangxuan/edge/data/ucf_crime_hf",
+    "duration_filter_for_added_rows_s": [
+      40.0,
+      240.0
+    ],
+    "anomaly_fill": "category-balanced, candidates sorted by duration closest to 120s then video_id",
+    "normal_fill": "candidates sorted by duration closest to 120s then video_id",
+    "tsv_order": "interleaved anomaly,normal pairs",
+    "partition_source_order": "first 100 anomaly then 100 normal; bench.py --playlist-mode partition --n 100 assigns one anomaly and one normal per stream"
+  },
+  "outputs": {
+    "balanced_tsv": "/home/admin123/tangxuan/edge/data/ucf_crime_hf/eval_videos_balanced_100a_100n.tsv",
+    "partition_n100_sources": "/home/admin123/tangxuan/edge/data/ucf_crime_hf/sources_balanced_100a_100n_partition_n100.txt",
+    "interleaved_sources": "/home/admin123/tangxuan/edge/data/ucf_crime_hf/sources_balanced_100a_100n_interleaved.txt",
+    "summary": "/home/admin123/tangxuan/edge/data/ucf_crime_hf/eval_videos_balanced_100a_100n_summary.json"
+  },
+  "counts": {
+    "balanced_tsv_rows": 200,
+    "labels": {
+      "anomaly": 100,
+      "normal": 100
+    },
+    "existing_included_by_label": {
+      "anomaly": 16,
+      "normal": 20
+    },
+    "missing_current_ids_in_full": []
+  },
+  "anomaly_category_counts": {
+    "Abuse": 8,
+    "Arrest": 8,
+    "Arson": 8,
+    "Assault": 8,
+    "Burglary": 8,
+    "Explosion": 8,
+    "Fighting": 8,
+    "RoadAccidents": 8,
+    "Robbery": 8,
+    "Shooting": 7,
+    "Shoplifting": 7,
+    "Stealing": 7,
+    "Vandalism": 7
+  },
+  "duration_s": {
+    "anomaly": {
+      "min": 84.8,
+      "max": 205.2,
+      "mean": 120.45200000000001
+    },
+    "normal": {
+      "min": 80.8,
+      "max": 222.0,
+      "mean": 122.316
+    }
+  },
+  "first_10_tsv_video_ids": [
+    "Arrest024_x264",
+    "Normal_Videos_439_x264",
+    "Arrest001_x264",
+    "Normal_Videos_453_x264",
+    "Arson010_x264",
+    "Normal_Videos_886_x264",
+    "Arson041_x264",
+    "Normal_Videos_019_x264",
+    "Assault011_x264",
+    "Normal_Videos_895_x264"
+  ],
+  "first_5_partition_anomaly_ids": [
+    "Arrest024_x264",
+    "Arrest001_x264",
+    "Arson010_x264",
+    "Arson041_x264",
+    "Assault011_x264"
+  ],
+  "first_5_partition_normal_ids": [
+    "Normal_Videos_439_x264",
+    "Normal_Videos_453_x264",
+    "Normal_Videos_886_x264",
+    "Normal_Videos_019_x264",
+    "Normal_Videos_895_x264"
+  ]
+}

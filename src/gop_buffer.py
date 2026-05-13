@@ -5,12 +5,17 @@ Rules:
   * Selection is decoder-safe: we only ever keep an IDR-aligned prefix of a
     GOP. Dropping the tail of a closed GOP does not break any kept frame's
     reference chain.
+  * If an open GOP is flushed early at a window/decision boundary, the
+    remaining tail of that original GOP must also be dropped until the next
+    IDR. Otherwise later windows could forward P/B frames whose references
+    were pruned by the earlier prefix decision.
   * Three decision modes: KEEP_ALL, KEEP_PREFIX(k), IDR_ONLY. IDR is always
     kept so temporal continuity is preserved on the cloud.
 
 ρ is read from `RhoState` at every finalize, so cloud-driven updates apply
-at the next GOP boundary; per-GOP aggregated score can push the decision
-above or below the current ρ.
+at the next GOP boundary. In the historical soft mode, per-GOP aggregated
+score can push the decision above or below the current ρ. In hard-cap mode,
+ρ is a strict non-IDR prefix budget used by cloud send-window control.
 """
 
 from __future__ import annotations
@@ -68,12 +73,26 @@ class GopBuffer:
         self._cur_features: List[PacketFeatures] = []
         self._cur_scores: List[float] = []
         self._cur_gop_index: int = -1
+        self._drop_until_idr: bool = False
 
     def push(self, rec: PacketRecord, feats: PacketFeatures) -> Optional[GopBatch]:
+        if self._drop_until_idr:
+            if not feats.is_idr:
+                return None
+            self._drop_until_idr = False
+            self._reset()
+
+        if not feats.is_idr and not self._cur_packets:
+            # The source can start mid-GOP, or we may have just emitted an
+            # early open-GOP prefix. Non-IDR packets before the next IDR are
+            # not independently decodable, so do not start a new batch here.
+            self._drop_until_idr = True
+            return None
+
         score = self.scorer_fn(feats)
         flush_batch: Optional[GopBatch] = None
         if feats.is_idr and self._cur_packets:
-            flush_batch = self._finalize()
+            flush_batch = self._finalize() if self._has_idr() else None
             self._reset()
         if feats.is_idr:
             self._cur_gop_index = feats.gop_index
@@ -82,17 +101,29 @@ class GopBuffer:
         self._cur_scores.append(score)
         return flush_batch
 
-    def flush(self) -> Optional[GopBatch]:
+    def flush(self, *, discard_until_idr: bool = False) -> Optional[GopBatch]:
         if not self._cur_packets:
+            if discard_until_idr:
+                self._drop_until_idr = True
+            return None
+        if not self._has_idr():
+            self._reset()
+            if discard_until_idr:
+                self._drop_until_idr = True
             return None
         batch = self._finalize()
         self._reset()
+        if discard_until_idr:
+            self._drop_until_idr = True
         return batch
 
     def _reset(self) -> None:
         self._cur_packets = []
         self._cur_features = []
         self._cur_scores = []
+
+    def _has_idr(self) -> bool:
+        return any(f.is_idr for f in self._cur_features)
 
     def _finalize(self) -> GopBatch:
         n = len(self._cur_packets)
@@ -101,12 +132,19 @@ class GopBuffer:
 
         gop_score = self._aggregate_score(self._cur_scores)
         rho = self.rho_state.current
-        target_keep = int(math.ceil(rho * n_non_idr))
-        target_keep = max(self.cfg.min_keep_per_gop, min(n_non_idr, target_keep))
+        if self.cfg.rho_hard_cap:
+            # The cloud send-window maps to rho as an upper bound. In this
+            # mode GOP salience may decide which prefix budget is available in
+            # future implementations, but it must not inflate the cloud cap.
+            target_keep = int(math.floor(max(0.0, rho) * n_non_idr))
+            keep_non_idr = max(self.cfg.min_keep_per_gop, min(n_non_idr, target_keep))
+        else:
+            target_keep = int(math.ceil(rho * n_non_idr))
+            target_keep = max(self.cfg.min_keep_per_gop, min(n_non_idr, target_keep))
 
-        activity_boost = math.tanh(max(0.0, gop_score))
-        keep_non_idr = min(n_non_idr, int(round(target_keep * (0.5 + activity_boost))))
-        keep_non_idr = max(0, keep_non_idr)
+            activity_boost = math.tanh(max(0.0, gop_score))
+            keep_non_idr = min(n_non_idr, int(round(target_keep * (0.5 + activity_boost))))
+            keep_non_idr = max(0, keep_non_idr)
 
         if keep_non_idr >= n_non_idr and n_non_idr > 0:
             mode = MODE_ALL

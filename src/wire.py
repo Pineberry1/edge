@@ -3,7 +3,8 @@
 Two framings share one WS connection:
 
   TEXT frames  — JSON control messages (hello, window_open, window_close,
-                 rho_update, result, bye). One object per frame.
+                 stream_end, rho_update, budget_update, early_finalize,
+                 result, bye). One object per frame.
   BINARY frames — per-packet data: `[4B BE header_len][JSON header][payload]`.
                  The WebSocket frame boundary is the message boundary, so no
                  outer length prefix is needed; the inner 4-byte header length
@@ -27,7 +28,11 @@ MSG_HELLO = "hello"
 MSG_PACKET = "packet"
 MSG_WINDOW_OPEN = "window_open"
 MSG_WINDOW_CLOSE = "window_close"
+MSG_EDGE_STATS = "edge_stats"
+MSG_STREAM_END = "stream_end"
 MSG_RHO_UPDATE = "rho_update"
+MSG_BUDGET_UPDATE = "budget_update"
+MSG_EARLY_FINALIZE = "early_finalize"
 MSG_RESULT = "result"
 MSG_BYE = "bye"
 

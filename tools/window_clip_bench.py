@@ -60,11 +60,14 @@ def launch_edge_once(
     rho: float,
     alpha: Optional[float],
     internal_window_s: float,
+    decision_window_s: float,
     max_tokens: int,
     prompt: str,
     log_path: Path,
     linger_s: float,
     pace_realtime: bool,
+    inference_mode: str,
+    visual_memory_merge: bool,
 ) -> subprocess.Popen:
     env = os.environ.copy()
     env["PYTHONPATH"] = f"{REPO}:{env.get('PYTHONPATH', '')}"
@@ -78,11 +81,16 @@ def launch_edge_once(
         "--max-tokens", str(max_tokens),
         "--linger-s", str(linger_s),
         "--prompt", prompt,
+        "--inference-mode", inference_mode,
     ]
+    if decision_window_s > 0:
+        cmd += ["--decision-window-seconds", str(decision_window_s)]
     if pace_realtime:
         cmd.append("--pace-realtime")
     if alpha is not None:
         cmd += ["--alpha", str(alpha)]
+    if visual_memory_merge:
+        cmd.append("--visual-memory-merge")
     log_fp = log_path.open("w")
     proc = subprocess.Popen(
         cmd, cwd=str(REPO), env=env,
@@ -108,9 +116,19 @@ def main() -> int:
     parser.add_argument("--alpha", type=float, default=None)
     parser.add_argument("--internal-window-seconds", type=float, default=9999.0,
                         help="edge session window; keep larger than clip duration")
+    parser.add_argument("--decision-window-seconds", type=float, default=0.0,
+                        help="edge stream_end cadence; <=0 keeps edge default")
     parser.add_argument("--max-tokens", type=int, default=4)
     parser.add_argument("--prompt", default="Does this 40-second video clip contain any "
                         "abnormal, criminal, or unsafe activity? Answer with only Yes or No.")
+    parser.add_argument("--inference-mode", choices=["online_prefill", "completion"], default="online_prefill")
+    parser.add_argument("--completion-mode", action="store_true",
+                        help="shortcut for --inference-mode completion")
+    parser.add_argument(
+        "--visual-memory-merge",
+        action="store_true",
+        help="set hello.visual_memory_merge=true for each window stream",
+    )
     parser.add_argument("--concurrency", type=int, default=8)
     parser.add_argument("--linger-s", type=float, default=12.0)
     parser.add_argument("--pace-realtime", action="store_true")
@@ -121,6 +139,8 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--out", required=True, type=Path)
     args = parser.parse_args()
+    if args.completion_mode:
+        args.inference_mode = "completion"
 
     rows = read_manifest(args.manifest)
     if args.limit:
@@ -166,11 +186,14 @@ def main() -> int:
                 rho=args.rho,
                 alpha=args.alpha,
                 internal_window_s=args.internal_window_seconds,
+                decision_window_s=args.decision_window_seconds,
                 max_tokens=args.max_tokens,
                 prompt=args.prompt,
                 log_path=log_path,
                 linger_s=args.linger_s,
                 pace_realtime=args.pace_realtime,
+                inference_mode=args.inference_mode,
+                visual_memory_merge=bool(args.visual_memory_merge),
             )
             deadline = time.time() + args.per_window_timeout
             rc = None
@@ -265,7 +288,10 @@ def main() -> int:
         "rho": args.rho,
         "alpha": args.alpha,
         "prompt": args.prompt,
+        "inference_mode": args.inference_mode,
+        "visual_memory_merge": bool(args.visual_memory_merge),
         "internal_window_seconds": args.internal_window_seconds,
+        "decision_window_seconds": args.decision_window_seconds,
         "max_tokens": args.max_tokens,
         "streams": sorted(completed, key=lambda r: r["stream_id"]),
     }

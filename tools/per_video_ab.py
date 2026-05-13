@@ -20,7 +20,8 @@ its CONFIGS list.
 Usage:
   python -m edge.tools.per_video_ab \
       --manifest edge/data/eval_videos.tsv \
-      --concurrency 4 --window-seconds 40 --frames-per-window 80 --max-tokens 8 \
+      --concurrency 4 --window-seconds 4 --decision-window-seconds 40 \
+      --frames-per-window 80 --max-tokens 8 \
       --linger-s 30 \
       --vllm-api-base-list http://127.0.0.1:8011,http://127.0.0.1:8012,http://127.0.0.1:8013,http://127.0.0.1:8014 \
       --intake-admin-base http://127.0.0.1:19100 \
@@ -68,6 +69,7 @@ def run_per_video_bench(
     cfg: dict,
     args: argparse.Namespace,
     out_dir: Path,
+    visual_memory_merge: bool = False,
 ) -> dict:
     cmd = [
         sys.executable, "-m", "edge.tools.per_video_bench",
@@ -76,6 +78,7 @@ def run_per_video_bench(
         "--intake-admin-base", args.intake_admin_base,
         "--rho", str(cfg["rho"]),
         "--window-seconds", str(args.window_seconds),
+        "--decision-window-seconds", str(args.decision_window_seconds),
         "--max-tokens", str(args.max_tokens),
         "--prompt", args.prompt,
         "--concurrency", str(args.concurrency),
@@ -91,6 +94,8 @@ def run_per_video_bench(
         cmd.append("--pace-realtime")
     if args.stop_after_result:
         cmd.append("--stop-after-result")
+    if visual_memory_merge:
+        cmd.append("--visual-memory-merge")
     env = os.environ.copy()
     env["PYTHONPATH"] = f"{REPO}:{env.get('PYTHONPATH', '')}"
     print(f"[ab] -> {' '.join(shlex.quote(c) for c in cmd)}")
@@ -112,7 +117,10 @@ def main() -> int:
     p.add_argument("--cloud-ws-url", default="ws://127.0.0.1:19100/stream")
     p.add_argument("--vllm-api-base", default="http://127.0.0.1:8011")
     p.add_argument("--vllm-api-base-list", default="")
-    p.add_argument("--window-seconds", type=float, default=40.0)
+    p.add_argument("--window-seconds", type=float, default=4.0,
+                   help="small online-prefill chunk size")
+    p.add_argument("--decision-window-seconds", type=float, default=40.0,
+                   help="edge-side stream_end/detection cadence")
     p.add_argument("--max-tokens", type=int, default=8)
     p.add_argument("--frames-per-window", type=int, default=80,
                    help="BAVA_MAX_FRAMES_PER_WINDOW (cloud subsamples to this)")
@@ -125,13 +133,44 @@ def main() -> int:
     p.add_argument("--linger-s", type=float, default=30.0)
     p.add_argument("--pace-realtime", action="store_true",
                    help="play each source at media time; omit for pure inference throughput")
+    p.add_argument(
+        "--visual-memory-merge",
+        action="store_true",
+        help="set hello.visual_memory_merge=true for each video stream",
+    )
+    p.add_argument(
+        "--visual-memory-num-frames",
+        type=int,
+        default=int(os.environ.get("BAVA_VISUAL_MEMORY_NUM_FRAMES", "8")),
+    )
+    p.add_argument(
+        "--visual-memory-tokens-per-frame",
+        type=int,
+        default=int(os.environ.get("BAVA_VISUAL_MEMORY_TOKENS_PER_FRAME", "32")),
+    )
+    p.add_argument(
+        "--visual-memory-text-prefix",
+        default=os.environ.get("BAVA_VISUAL_MEMORY_TEXT_PREFIX", ""),
+    )
+    p.add_argument(
+        "--visual-memory-warm-prefix-cache",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="warm prefix cache after exporting visual memory (default: intake env)",
+    )
     p.add_argument("--stop-after-result", action="store_true",
                    help="terminate edge subprocesses after the first VLM result")
     p.add_argument("--per-video-timeout", type=float, default=600.0)
     p.add_argument(
         "--prompt",
-        default=("Does this video clip contain any abnormal, criminal, or unsafe activity? "
-                 "Answer with only 'Yes' or 'No'."),
+        default=(
+            "Classify this video clip for surveillance anomaly detection. "
+            "Output only Yes or No. Yes means the clip shows one of these "
+            "abnormal categories: arrest, arson, assault, burglary, fighting, "
+            "road accident, robbery, shooting, shoplifting, stealing, vandalism, "
+            "explosion, abuse, or any clearly unsafe/criminal behavior. No means "
+            "normal non-criminal activity without visible danger."
+        ),
     )
     p.add_argument("--limit", type=int, default=0,
                    help="limit number of videos (0 = all)")
@@ -155,10 +194,18 @@ def main() -> int:
         "manifest": str(args.manifest),
         "vllm_api_bases": vllm_api_bases,
         "window_seconds": args.window_seconds,
+        "decision_window_seconds": args.decision_window_seconds,
         "frames_per_window": args.frames_per_window,
         "concurrency": args.concurrency,
         "linger_s": args.linger_s,
         "pace_realtime": args.pace_realtime,
+        "visual_memory_merge": bool(args.visual_memory_merge),
+        "visual_memory": {
+            "num_frames": int(args.visual_memory_num_frames),
+            "tokens_per_frame": int(args.visual_memory_tokens_per_frame),
+            "text_prefix": args.visual_memory_text_prefix,
+            "warm_prefix_cache": args.visual_memory_warm_prefix_cache,
+        },
         "stop_after_result": args.stop_after_result,
         "prompt": args.prompt,
         "configs_run": [c["name"] for c in cfgs],
@@ -198,6 +245,20 @@ def main() -> int:
                 "BAVA_MAX_FRAMES_PER_WINDOW": str(args.frames_per_window),
                 "BAVA_MAX_QUEUED_WINDOWS": str(args.max_queued_windows),
                 "BAVA_STREAM_CONCURRENCY": str(args.stream_concurrency),
+                "BAVA_VISUAL_MEMORY_NUM_FRAMES": str(args.visual_memory_num_frames),
+                "BAVA_VISUAL_MEMORY_TOKENS_PER_FRAME": str(
+                    args.visual_memory_tokens_per_frame
+                ),
+                "BAVA_VISUAL_MEMORY_TEXT_PREFIX": args.visual_memory_text_prefix,
+                **(
+                    {
+                        "BAVA_VISUAL_MEMORY_WARM_PREFIX_CACHE": (
+                            "1" if args.visual_memory_warm_prefix_cache else "0"
+                        )
+                    }
+                    if args.visual_memory_warm_prefix_cache is not None
+                    else {}
+                ),
             },
             log_suffix=f"_{name}",
         )
@@ -214,7 +275,13 @@ def main() -> int:
         aborted = purge_sessions(args.intake_admin_base)
         print(f"[ab] post-start purge: aborted={aborted}")
 
-        summary = run_per_video_bench(args.manifest, cfg, args, cfg_out)
+        summary = run_per_video_bench(
+            args.manifest,
+            cfg,
+            args,
+            cfg_out,
+            visual_memory_merge=bool(args.visual_memory_merge),
+        )
 
         for remote, local in (
             (remote_controller_log, cfg_out / "controller.jsonl"),

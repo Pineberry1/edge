@@ -38,8 +38,17 @@ from urllib import request as urlreq
 
 import av  # noqa: F401  - rely on existing av installation
 
+from edge.tools.ab_bench import (
+    _start_gpu_monitor,
+    _stop_gpu_monitor,
+    _summarize_gpu_csv,
+)
+
 
 REPO = Path(__file__).resolve().parent.parent.parent
+JPEG_ENCODE_SEM = threading.Semaphore(
+    max(1, int(os.environ.get("BAVA_COMPLETION_JPEG_CONCURRENCY", "4")))
+)
 
 
 def read_manifest(path: Path) -> list[dict]:
@@ -63,26 +72,34 @@ class Frame:
 
 
 def encode_video_frame_jpeg_b64(frame: av.VideoFrame, jpeg_quality: int = 75) -> str:
-    """Encode a PyAV frame to JPEG base64 without requiring Pillow/cv2."""
-    codec = av.CodecContext.create("mjpeg", "w")
-    codec.width = frame.width
-    codec.height = frame.height
-    codec.pix_fmt = "yuvj420p"
-    # ffmpeg/mjpeg accepts qscale roughly in [2,31], lower is better.
-    qscale = max(2, min(31, int(round((100 - jpeg_quality) / 100 * 29 + 2))))
-    fr = frame.reformat(format="yuvj420p")
-    packets = codec.encode(fr)
-    for pkt in codec.encode(None):
-        packets.append(pkt)
-    data = b"".join(bytes(pkt) for pkt in packets)
-    return base64.b64encode(data).decode()
+    """Encode a PyAV frame to JPEG base64."""
+    with JPEG_ENCODE_SEM:
+        try:
+            image = frame.to_image()
+            buf = io.BytesIO()
+            image.save(buf, format="JPEG", quality=jpeg_quality)
+            return base64.b64encode(buf.getvalue()).decode()
+        except Exception:
+            pass
+
+        codec = av.CodecContext.create("mjpeg", "w")
+        codec.width = frame.width
+        codec.height = frame.height
+        codec.pix_fmt = "yuvj420p"
+        fr = frame.reformat(format="yuvj420p")
+        packets = codec.encode(fr)
+        for pkt in codec.encode(None):
+            packets.append(pkt)
+        data = b"".join(bytes(pkt) for pkt in packets)
+        return base64.b64encode(data).decode()
 
 
 def extract_frames(source: Path, start_s: float, end_s: float, n: int,
                    jpeg_quality: int = 75) -> list[Frame]:
-    """Extract `n` evenly-spaced frames from [start_s, end_s) of `source`.
+    """Extract frames from [start_s, end_s) of `source`.
 
-    Returns frames sorted by pts. Uses pyav for low-overhead seeking.
+    When n > 0, return n evenly-spaced frames. When n <= 0, return every
+    decoded frame in the interval without duplicating short clips.
     """
     container = av.open(str(source))
     stream = container.streams.video[0]
@@ -91,8 +108,7 @@ def extract_frames(source: Path, start_s: float, end_s: float, n: int,
     if end_s <= start_s:
         container.close()
         return []
-    targets = [start_s + (end_s - start_s) * (i + 0.5) / n for i in range(n)]
-    targets_left = list(targets)
+    targets = [start_s + (end_s - start_s) * (i + 0.5) / n for i in range(n)] if n > 0 else []
 
     # Seek to start of window (pyav seeks to keyframe).
     seek_pts = max(0, int((start_s) / stream.time_base))
@@ -111,11 +127,22 @@ def extract_frames(source: Path, start_s: float, end_s: float, n: int,
                 continue
             if t >= end_s:
                 container.close()
+                if n <= 0:
+                    return _finalize_all(out, jpeg_quality)
                 return _finalize(out, targets, jpeg_quality)
             # collect this frame for later target matching
             out.append((t, frame))
     container.close()
+    if n <= 0:
+        return _finalize_all(out, jpeg_quality)
     return _finalize(out, targets, jpeg_quality)
+
+
+def _finalize_all(samples, jpeg_quality):
+    return [
+        Frame(pts_s=t, image_b64=encode_video_frame_jpeg_b64(frame, jpeg_quality))
+        for t, frame in samples
+    ]
 
 
 def _finalize(samples, targets, jpeg_quality):
@@ -220,14 +247,21 @@ def process_video(slot: int, vidx: int, video: dict, model: str,
             log_fp.write(f"[edge-uplink] vllm-fail window={w} err={e}\n")
             log_fp.flush()
             continue
+        e2e_ms = (time.time() - (started + start_s)) * 1000.0
         # Match the edge result-line format expected by summarize_anomaly_f1
         log_fp.write(f"[edge-uplink] result window={w} text='{text}'\n")
         log_fp.flush()
+        usage = meta.get("usage") or {}
         per_window.append({
             "window_id": w,
             "n_frames": meta["n_frames"],
             "elapsed_ms": meta["elapsed_ms"],
+            "e2e_ms": e2e_ms,
             "text": text,
+            "usage": usage,
+            "prompt_tokens": usage.get("prompt_tokens"),
+            "completion_tokens": usage.get("completion_tokens"),
+            "total_tokens": usage.get("total_tokens"),
         })
     log_fp.close()
     ended = time.time()
@@ -259,11 +293,24 @@ def main() -> int:
                    help="comma-separated list of vLLM endpoints (round-robin per worker)")
     p.add_argument("--window-seconds", type=float, default=40.0)
     p.add_argument("--stride-seconds", type=float, default=20.0)
-    p.add_argument("--frames-per-window", type=int, default=80)
+    p.add_argument(
+        "--frames-per-window",
+        type=int,
+        default=80,
+        help="number of evenly sampled frames per window; <=0 sends all decoded frames in the window",
+    )
     p.add_argument("--max-tokens", type=int, default=16)
-    p.add_argument("--prompt",
-                   default=("Does this video clip contain any abnormal, criminal, or unsafe activity? "
-                            "Answer with only 'Yes' or 'No'."))
+    p.add_argument(
+        "--prompt",
+        default=(
+            "Classify this video clip for surveillance anomaly detection. "
+            "Output only Yes or No. Yes means the clip shows one of these "
+            "abnormal categories: arrest, arson, assault, burglary, fighting, "
+            "road accident, robbery, shooting, shoplifting, stealing, vandalism, "
+            "explosion, abuse, or any clearly unsafe/criminal behavior. No means "
+            "normal non-criminal activity without visible danger."
+        ),
+    )
     p.add_argument("--concurrency", type=int, default=1)
     p.add_argument("--pace-realtime", action="store_true",
                    help="wait until each window's end time before sending completion")
@@ -277,6 +324,17 @@ def main() -> int:
                    default="/home/mambauser/tangxuan/ucf_crime_hf",
                    help="remote dataset prefix to replace with --local-root")
     p.add_argument("--limit", type=int, default=0)
+    p.add_argument("--cloud-host", default="210.45.123.163")
+    p.add_argument("--cloud-ssh-port", type=int, default=2222)
+    p.add_argument("--cloud-ssh-user", default="mambauser")
+    p.add_argument("--cloud-ssh-key", default=os.path.expanduser("~/.ssh/jupyterhub.pem"))
+    p.add_argument(
+        "--gpu-monitor",
+        action="store_true",
+        help="sample remote nvidia-smi during the run and write gpu_smi.csv/gpu_summary.json",
+    )
+    p.add_argument("--gpu-monitor-gpus", default="0,1,2,3")
+    p.add_argument("--gpu-monitor-interval", type=float, default=0.5)
     p.add_argument("--out", required=True, type=Path)
     args = p.parse_args()
     args.frame_extract_sem = threading.Semaphore(max(1, args.frame_extract_concurrency))
@@ -342,14 +400,33 @@ def main() -> int:
             with completed_lock:
                 completed.append(rec)
 
+    gpu_proc = None
+    gpu_summary = None
+    gpu_csv = out / "gpu_smi.csv"
     started_at = time.time()
-    workers = [threading.Thread(target=worker, args=(i,), daemon=False)
-               for i in range(args.concurrency)]
-    for w in workers:
-        w.start()
-    for w in workers:
-        w.join()
+    try:
+        if args.gpu_monitor:
+            gpu_proc = _start_gpu_monitor(
+                cloud_host=args.cloud_host,
+                ssh_port=args.cloud_ssh_port,
+                ssh_key=args.cloud_ssh_key,
+                user=args.cloud_ssh_user,
+                gpu_ids=args.gpu_monitor_gpus,
+                interval_s=args.gpu_monitor_interval,
+                out_csv=gpu_csv,
+            )
+        workers = [threading.Thread(target=worker, args=(i,), daemon=False)
+                   for i in range(args.concurrency)]
+        for w in workers:
+            w.start()
+        for w in workers:
+            w.join()
+    finally:
+        _stop_gpu_monitor(gpu_proc)
     ended_at = time.time()
+    if args.gpu_monitor:
+        gpu_summary = _summarize_gpu_csv(gpu_csv)
+        (out / "gpu_summary.json").write_text(json.dumps(gpu_summary, indent=2))
 
     manifest = {
         "started_at": started_at,
@@ -367,6 +444,13 @@ def main() -> int:
         "vllm_api_base_list": args.vllm_api_base_list,
         "model": model,
         "prompt": args.prompt,
+        "gpu_monitor": {
+            "enabled": bool(args.gpu_monitor),
+            "gpus": args.gpu_monitor_gpus,
+            "interval_s": float(args.gpu_monitor_interval),
+            "gpu_smi_path": str(gpu_csv) if args.gpu_monitor else None,
+            "gpu_summary_path": str(out / "gpu_summary.json") if args.gpu_monitor else None,
+        },
         "streams": sorted(completed, key=lambda r: r["started_at"]),
     }
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2, default=str))
@@ -375,6 +459,7 @@ def main() -> int:
         "wall_s": ended_at - started_at,
         "n_total_windows": sum(len(s["per_window"]) for s in completed),
         "manifest": str(out / "manifest.json"),
+        "gpu_summary": gpu_summary,
     }
     (out / "summary.json").write_text(json.dumps(summary, indent=2, default=str))
     print(f"[completion] DONE: {n} videos in {ended_at-started_at:.1f}s "
